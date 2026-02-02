@@ -77,6 +77,7 @@ final class WebRTCService: NSObject,ObservableObject {
     func startCall() {
         print("📞 [WebRTC] startCall")
         signaling.connect()
+        configureAudioSession()
         startLocalMedia()   // 👈 ADD THIS
         createOffer()
     }
@@ -145,6 +146,22 @@ final class WebRTCService: NSObject,ObservableObject {
 
         print("▶️ [WebRTC] Camera capture started")
     }
+    
+    private func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(
+                .playAndRecord,
+                mode: .videoChat,
+                options: [.defaultToSpeaker, .allowBluetooth]
+            )
+            try session.setActive(true)
+            print("🔊 [Audio] Session configured")
+        } catch {
+            print("❌ [Audio] Session error:", error)
+        }
+    }
+
 
 
     // MARK: - Offer
@@ -374,7 +391,22 @@ extension WebRTCService: RTCPeerConnectionDelegate {
         print("📡 [WebRTC] ICE gathering:", newState.rawValue)
     }
 
-    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {}
+    func peerConnection(
+        _ peerConnection: RTCPeerConnection,
+        didAdd stream: RTCMediaStream
+    ) {
+        if let videoTrack = stream.videoTracks.first {
+            DispatchQueue.main.async {
+                print("📺 [WebRTC] Remote VIDEO track received")
+                self.remoteVideoTrack = videoTrack
+            }
+        }
+
+        if let audioTrack = stream.audioTracks.first {
+            print("🔊 [WebRTC] Remote AUDIO track received")
+        }
+    }
+
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
     func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {}
 }
