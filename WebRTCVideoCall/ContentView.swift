@@ -85,10 +85,14 @@ struct ContentView: View {
                 .font(.title2)
 
             Button("Start Video Call") {
-                print("📞 UI: Start Call tapped")
+                guard signaling.isConnected else {
+                    print("⚠️ Socket not connected yet")
+                    return
+                }
                 rtc.startCall()
                 state = .calling
             }
+
             .padding()
             .background(Color.blue)
             .foregroundColor(.white)
