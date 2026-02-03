@@ -118,10 +118,9 @@ private extension ContentView {
                     .font(.caption)
                     .foregroundColor(.gray)
 
-                Text(shortUserId(signaling.myUserId))
-                    .font(.title2)
+                Text(signaling.myUserId ?? "--")
+                    .font(.title3)
                     .bold()
-
             }
 
             Divider()
@@ -178,10 +177,9 @@ private extension ContentView {
             Text("From")
                 .foregroundColor(.gray)
 
-            Text(shortUserId(userId))
+            Text(userId)
                 .font(.title2)
                 .bold()
-
 
             HStack(spacing: 20) {
 
@@ -259,14 +257,3 @@ private extension ContentView {
 
 }
 
-extension ContentView {
-    private func shortUserId(_ id: String?) -> String {
-        guard let id else { return "--" }
-        if id.count <= 8 { return id }
-
-        let start = id.prefix(2)
-        let end = id.suffix(2)
-        return "\(start)…\(end)"
-    }
-
-}
