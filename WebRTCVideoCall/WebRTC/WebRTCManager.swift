@@ -1,345 +1,294 @@
-//
-//  WebRTCManager.swift
-//  WebRTCVideoCall
-//
-//  Created by Sumit Raj Chingari on 02/02/26.
-//
-
-import WebRTC
 import Foundation
+import WebRTC
+import AVFoundation
 import Combine
 
-final class WebRTCService: NSObject,ObservableObject {
-    
-    
-    // MARK: - Media
-    private var videoSource: RTCVideoSource?
-    private var videoCapturer: RTCCameraVideoCapturer?
-    private var capturer: RTCCameraVideoCapturer?
-    private var localAudioTrack: RTCAudioTrack?
+// MARK: - Call Side
+enum CallSide {
+    case none
+    case sender
+    case receiver
+}
+
+// MARK: - SDP State
+enum SDPFlowState {
+    case idle
+    case localOfferSet
+    case remoteOfferSet
+    case stable
+}
+
+@MainActor
+final class WebRTCManager: NSObject, ObservableObject {
+
+    // MARK: - UI Bindings
     @Published var localVideoTrack: RTCVideoTrack?
     @Published var remoteVideoTrack: RTCVideoTrack?
 
-
-
-    // MARK: - Properties
+    // MARK: - Core
+    private let signaling: SignalingClient
     private let factory: RTCPeerConnectionFactory
-    private let peerConnection: RTCPeerConnection
-    private let signaling: SignalingService
+    private var peerConnection: RTCPeerConnection!
+
+    private var videoCapturer: RTCCameraVideoCapturer?
+
+    // MARK: - State
+    private(set) var side: CallSide = .none
+    private(set) var sdpState: SDPFlowState = .idle
+
+    private var pendingICE: [RTCIceCandidate] = []
+    private var remoteUserId: String?
 
     // MARK: - Init
-    init(signaling: SignalingService) {
-
-        RTCInitializeSSL()
-        print("🔐 [WebRTC] SSL initialized")
-
-        self.factory = RTCPeerConnectionFactory()
+    init(signaling: SignalingClient) {
         self.signaling = signaling
 
-        // --- RTC Configuration
+        RTCInitializeSSL()
+        factory = RTCPeerConnectionFactory(
+            encoderFactory: RTCDefaultVideoEncoderFactory(),
+            decoderFactory: RTCDefaultVideoDecoderFactory()
+        )
+
+        super.init()
+        setupPeerConnection()
+        bindSignaling()
+        print("🤝 [WebRTC] PeerConnection ready")
+    }
+
+    // MARK: - PeerConnection
+    private func setupPeerConnection() {
         let config = RTCConfiguration()
+        config.sdpSemantics = .unifiedPlan
         config.iceServers = [
             RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"])
         ]
-        config.sdpSemantics = .unifiedPlan
-        print("🌍 [WebRTC] ICE configured")
 
-        // --- Media Constraints (IMPORTANT)
+        let constraints = RTCMediaConstraints(
+            mandatoryConstraints: nil,
+            optionalConstraints: ["DtlsSrtpKeyAgreement": "true"]
+        )
+
+        peerConnection = factory.peerConnection(
+            with: config,
+            constraints: constraints,
+            delegate: self
+        )
+    }
+
+    // MARK: - Signaling Bind
+    private func bindSignaling() {
+        signaling.onEvent = { [weak self] event in
+            guard let self else { return }
+
+            switch event {
+
+            case .incomingCall(let from):
+                self.remoteUserId = from
+                print("📲 Incoming call from \(from)")
+
+            case .callAccepted(let from):
+                self.remoteUserId = from
+                print("✅ Call accepted by \(from)")
+                self.createAndSendOffer()
+
+            case .offerReceived(let sdp, let from):
+                self.remoteUserId = from
+                self.handleRemoteOffer(sdp)
+
+            case .answerReceived(let sdp):
+                self.handleRemoteAnswer(sdp)
+
+            case .iceReceived(let candidate):
+                self.handleRemoteICE(candidate)
+
+            case .callEnded:
+                self.endCall()
+
+            default:
+                break
+            }
+        }
+    }
+
+    // MARK: - Call Flow
+    func startCallAsSender(to userId: String) {
+        guard side == .none else { return }
+
+        side = .sender
+        remoteUserId = userId
+        startLocalMedia()
+
+        print("📞 Sender started call → \(userId)")
+        signaling.startCall(to: userId)
+    }
+
+    func acceptIncomingCall() {
+        guard side == .none, let remoteUserId else { return }
+
+        side = .receiver
+        startLocalMedia()
+
+        print("✅ Receiver accepted call")
+        signaling.acceptCall(from: remoteUserId)
+    }
+
+    // MARK: - Offer / Answer
+    private func createAndSendOffer() {
+        guard side == .sender, let remoteUserId else { return }
+
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: [
                 "OfferToReceiveAudio": "true",
                 "OfferToReceiveVideo": "true"
             ],
-            optionalConstraints: [
-                "DtlsSrtpKeyAgreement": "true"
-            ]
+            optionalConstraints: nil
         )
 
-        guard let pc = factory.peerConnection(
-            with: config,
-            constraints: constraints,
-            delegate: nil
-        ) else {
-            fatalError("❌ [WebRTC] Failed to create PeerConnection")
+        Task {
+            do {
+                let offer = try await peerConnection.offer(for: constraints)
+                try await peerConnection.setLocalDescription(offer)
+                sdpState = .localOfferSet
+                signaling.sendOffer(to: remoteUserId, sdp: offer.sdp)
+                print("📤 OFFER sent")
+            } catch {
+                print("❌ Failed to create/send OFFER: \(error)")
+                return
+            }
         }
-
-        self.peerConnection = pc
-
-        super.init()
-
-        self.signaling.delegate = self
-        self.peerConnection.delegate = self
-
-        print("🤝 [WebRTC] PeerConnection ready")
     }
 
-    // MARK: - Public
-    func startCall() {
-        print("📞 [WebRTC] startCall")
-        signaling.connect()
-        configureAudioSession()
-        startLocalMedia()   // 👈 ADD THIS
-        createOffer()
+    private func handleRemoteOffer(_ sdp: String) {
+        guard side == .receiver else { return }
+
+        Task {
+            do {
+                let offer = RTCSessionDescription(type: .offer, sdp: sdp)
+                try await peerConnection.setRemoteDescription(offer)
+                sdpState = .remoteOfferSet
+                print("📥 OFFER received")
+                await createAndSendAnswer()
+            } catch {
+                print("❌ Failed to handle remote OFFER: \(error)")
+                return
+            }
+        }
     }
 
-    
-    func startLocalMedia() {
-        print("🎥🎙 [WebRTC] Starting local media")
+    private func createAndSendAnswer() async {
+        guard side == .receiver, let remoteUserId else { return }
 
-        // ---- Audio
-        let audioSource = factory.audioSource(with: nil)
-        localAudioTrack = factory.audioTrack(
-            with: audioSource,
+        let constraints = RTCMediaConstraints(
+            mandatoryConstraints: [
+                "OfferToReceiveAudio": "true",
+                "OfferToReceiveVideo": "true"
+            ],
+            optionalConstraints: nil
+        )
+
+        do {
+            let answer = try await peerConnection.answer(for: constraints)
+            try await peerConnection.setLocalDescription(answer)
+            sdpState = .stable
+            signaling.sendAnswer(to: remoteUserId, sdp: answer.sdp)
+            flushICE()
+            print("📤 ANSWER sent")
+        } catch {
+            print("❌ Failed to create/send ANSWER: \(error)")
+            return
+        }
+    }
+
+    private func handleRemoteAnswer(_ sdp: String) {
+        guard side == .sender else { return }
+
+        Task {
+            do {
+                let answer = RTCSessionDescription(type: .answer, sdp: sdp)
+                try await peerConnection.setRemoteDescription(answer)
+                sdpState = .stable
+                flushICE()
+                print("📥 ANSWER received")
+            } catch {
+                print("❌ Failed to handle remote ANSWER: \(error)")
+                return
+            }
+        }
+    }
+
+    // MARK: - ICE
+    private func handleRemoteICE(_ candidate: RTCIceCandidate) {
+        if sdpState == .stable {
+            peerConnection.add(candidate)
+        } else {
+            pendingICE.append(candidate)
+            print("🧊 ICE queued")
+        }
+    }
+
+    private func flushICE() {
+        pendingICE.forEach { peerConnection.add($0) }
+        pendingICE.removeAll()
+        print("❄️ ICE flushed")
+    }
+
+    // MARK: - Media
+    private func startLocalMedia() {
+
+        // Audio
+        let audioTrack = factory.audioTrack(
+            with: factory.audioSource(with: nil),
             trackId: "audio0"
         )
+        peerConnection.add(audioTrack, streamIds: ["stream0"])
 
-        if let audioTrack = localAudioTrack {
-            peerConnection.add(
-                audioTrack,
-                streamIds: ["stream0"]
-            )
-            print("🎙 [WebRTC] Audio track added")
-        }
+        // Video
+        let videoSource = factory.videoSource()
+        let videoTrack = factory.videoTrack(with: videoSource, trackId: "video0")
+        localVideoTrack = videoTrack
+        peerConnection.add(videoTrack, streamIds: ["stream0"])
 
-        // ---- Video
-        videoSource = factory.videoSource()
-        videoCapturer = RTCCameraVideoCapturer(delegate: videoSource!)
-
-        localVideoTrack = factory.videoTrack(
-            with: videoSource!,
-            trackId: "video0"
-        )
-
-        if let videoTrack = localVideoTrack {
-            peerConnection.add(
-                videoTrack,
-                streamIds: ["stream0"]
-            )
-            print("🎥 [WebRTC] Video track added")
-        }
-
+        videoCapturer = RTCCameraVideoCapturer(delegate: videoSource)
         startCameraCapture()
+        print("🎥🎙 Local media started")
     }
 
-    
     private func startCameraCapture() {
         guard
-            let capturer = videoCapturer,
             let device = RTCCameraVideoCapturer.captureDevices()
                 .first(where: { $0.position == .front }),
-            let format = device.formats
+            let format = RTCCameraVideoCapturer.supportedFormats(for: device)
                 .sorted(by: {
-                    CMVideoFormatDescriptionGetDimensions($0.formatDescription).width <
-                    CMVideoFormatDescriptionGetDimensions($1.formatDescription).width
-                }).last,
-            let fpsRange = format.videoSupportedFrameRateRanges.first
-        else {
-            print("❌ [WebRTC] Camera setup failed")
-            return
-        }
+                    $0.formatDescription.dimensions.width >
+                    $1.formatDescription.dimensions.width
+                }).first,
+            let fps = format.videoSupportedFrameRateRanges.first?.maxFrameRate
+        else { return }
 
-        capturer.startCapture(
+        videoCapturer?.startCapture(
             with: device,
             format: format,
-            fps: Int(fpsRange.maxFrameRate)
+            fps: Int(fps)
         )
-
-        print("▶️ [WebRTC] Camera capture started")
-    }
-    
-    private func configureAudioSession() {
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(
-                .playAndRecord,
-                mode: .videoChat,
-                options: [.defaultToSpeaker, .allowBluetooth]
-            )
-            try session.setActive(true)
-            print("🔊 [Audio] Session configured")
-        } catch {
-            print("❌ [Audio] Session error:", error)
-        }
     }
 
-
-
-    // MARK: - Offer
-    private func createOffer() {
-        print("📝 [WebRTC] Creating OFFER")
-
-        let offerConstraints = RTCMediaConstraints(
-            mandatoryConstraints: [
-                "OfferToReceiveAudio": "true",
-                "OfferToReceiveVideo": "true"
-            ],
-            optionalConstraints: nil
-        )
-
-        peerConnection.offer(for: offerConstraints) { [weak self] offer, error in
-            guard let self = self else { return }
-
-            if let error = error {
-                print("❌ [WebRTC] Offer error:", error)
-                return
-            }
-
-            guard let offer = offer else {
-                print("❌ [WebRTC] Offer is nil")
-                return
-            }
-
-            self.peerConnection.setLocalDescription(offer) { error in
-                if let error = error {
-                    print("❌ [WebRTC] setLocalDescription error:", error)
-                    return
-                }
-
-                print("📌 [WebRTC] Local OFFER set")
-
-                self.signaling.send([
-                    "type": "offer",
-                    "sdp": offer.sdp
-                ])
-            }
-        }
-    }
-    
-    // MARK: - End Call (CLEANUP)
+    // MARK: - End Call
     func endCall() {
-        print("🛑 [WebRTC] endCall started")
-
-        // 1️⃣ Stop camera
-        if let capturer = capturer {
-            capturer.stopCapture {
-                print("🎥 [WebRTC] Camera stopped")
-            }
-        }
-
-        // 2️⃣ Remove local tracks from PeerConnection
-        peerConnection.senders.forEach { sender in
-            if let track = sender.track {
-                print("➖ [WebRTC] Removing track:", track.kind)
-            }
-            peerConnection.removeTrack(sender)
-        }
-
-        // 3️⃣ Close PeerConnection
         peerConnection.close()
-        print("🔌 [WebRTC] PeerConnection closed")
-
-        // 4️⃣ Reset published tracks (UI auto update)
-        DispatchQueue.main.async {
-            self.localVideoTrack = nil
-            self.remoteVideoTrack = nil
-        }
-
-        // 5️⃣ Reset local references
-        videoSource = nil
-        capturer = nil
-        localVideoTrack = nil
-        localAudioTrack = nil
-
-        print("✅ [WebRTC] endCall completed")
-    }
-
-}
-extension WebRTCService: SignalingServiceDelegate {
-
-    func didReceiveOffer(_ sdp: String) {
-        print("📥 [WebRTC] OFFER received")
-
-        let desc = RTCSessionDescription(type: .offer, sdp: sdp)
-
-        peerConnection.setRemoteDescription(desc) { [weak self] error in
-            if let error = error {
-                print("❌ [WebRTC] setRemoteDescription error:", error)
-                return
-            }
-
-            print("📌 [WebRTC] Remote OFFER set")
-            self?.createAnswer()
-        }
-    }
-
-    private func createAnswer() {
-        print("📝 [WebRTC] Creating ANSWER")
-
-        let answerConstraints = RTCMediaConstraints(
-            mandatoryConstraints: [
-                "OfferToReceiveAudio": "true",
-                "OfferToReceiveVideo": "true"
-            ],
-            optionalConstraints: nil
-        )
-
-        peerConnection.answer(for: answerConstraints) { [weak self] answer, error in
-            guard let self = self else { return }
-
-            if let error = error {
-                print("❌ [WebRTC] Answer error:", error)
-                return
-            }
-
-            guard let answer = answer else {
-                print("❌ [WebRTC] Answer is nil")
-                return
-            }
-
-            self.peerConnection.setLocalDescription(answer) { error in
-                if let error = error {
-                    print("❌ [WebRTC] setLocalDescription error:", error)
-                    return
-                }
-
-                print("📌 [WebRTC] Local ANSWER set")
-
-                self.signaling.send([
-                    "type": "answer",
-                    "sdp": answer.sdp
-                ])
-            }
-        }
-    }
-
-    func didReceiveAnswer(_ sdp: String) {
-        print("📥 [WebRTC] ANSWER received")
-
-        let desc = RTCSessionDescription(type: .answer, sdp: sdp)
-
-        peerConnection.setRemoteDescription(desc) { error in
-            if let error = error {
-                print("❌ [WebRTC] setRemoteDescription error:", error)
-            } else {
-                print("📌 [WebRTC] Remote ANSWER set")
-            }
-        }
-    }
-
-    func didReceiveIceCandidate(_ dict: [String: Any]) {
-        print("🌐 [WebRTC] ICE received")
-
-        guard
-            let candidateSDP = dict["candidate"] as? String,
-            let sdpMLineIndex = dict["sdpMLineIndex"] as? Int32
-        else {
-            print("❌ [WebRTC] Invalid ICE candidate")
-            return
-        }
-
-        let sdpMid = dict["sdpMid"] as? String
-
-        let candidate = RTCIceCandidate(
-            sdp: candidateSDP,
-            sdpMLineIndex: sdpMLineIndex,
-            sdpMid: sdpMid
-        )
-
-        peerConnection.add(candidate)
+        pendingICE.removeAll()
+        side = .none
+        sdpState = .idle
+        print("❌ Call ended")
     }
 }
-extension WebRTCService: RTCPeerConnectionDelegate {
-    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {
+
+// MARK: - RTCPeerConnectionDelegate
+extension WebRTCManager: RTCPeerConnectionDelegate {
+    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {
+        
+    }
+    
+    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {
         
     }
     
@@ -349,64 +298,36 @@ extension WebRTCService: RTCPeerConnectionDelegate {
     
 
     func peerConnection(
-        _ peerConnection: RTCPeerConnection,
+        _ pc: RTCPeerConnection,
         didGenerate candidate: RTCIceCandidate
     ) {
-        print("🌐 [WebRTC] ICE generated")
+        guard let remoteUserId else { return }
 
-        signaling.send([
-            "type": "ice-candidate",
-            "candidate": [
-                "candidate": candidate.sdp,
-                "sdpMLineIndex": candidate.sdpMLineIndex,
-                "sdpMid": candidate.sdpMid ?? ""
-            ]
-        ])
+        if sdpState == .stable {
+            signaling.sendICE(to: remoteUserId, candidate: candidate)
+        } else {
+            pendingICE.append(candidate)
+        }
     }
 
+    /// ✅ Unified Plan correct callback
     func peerConnection(
-        _ peerConnection: RTCPeerConnection,
+        _ pc: RTCPeerConnection,
         didAdd rtpReceiver: RTCRtpReceiver,
         streams: [RTCMediaStream]
     ) {
-        if let videoTrack = rtpReceiver.track as? RTCVideoTrack {
-            print("📺 [WebRTC] Remote VIDEO track received")
-            // next step: UI render
-        }
+        guard
+            let track = rtpReceiver.track as? RTCVideoTrack
+        else { return }
 
-        if let audioTrack = rtpReceiver.track as? RTCAudioTrack {
-            print("🔊 [WebRTC] Remote AUDIO track received")
-        }
+        remoteVideoTrack = track
+        print("📺 Remote video track attached")
     }
 
-    func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {
-        print("🔄 [WebRTC] Signaling state:", stateChanged.rawValue)
-    }
-
-    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
-        print("❄️ [WebRTC] ICE state:", newState.rawValue)
-    }
-
-    func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {
-        print("📡 [WebRTC] ICE gathering:", newState.rawValue)
-    }
-
-    func peerConnection(
-        _ peerConnection: RTCPeerConnection,
-        didAdd stream: RTCMediaStream
-    ) {
-        if let videoTrack = stream.videoTracks.first {
-            DispatchQueue.main.async {
-                print("📺 [WebRTC] Remote VIDEO track received")
-                self.remoteVideoTrack = videoTrack
-            }
-        }
-
-        if let audioTrack = stream.audioTracks.first {
-            print("🔊 [WebRTC] Remote AUDIO track received")
-        }
-    }
-
-    func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
-    func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {}
+    // unused
+    func peerConnection(_ pc: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {}
+    func peerConnection(_ pc: RTCPeerConnection, didChange newState: RTCIceConnectionState) {}
+    func peerConnection(_ pc: RTCPeerConnection, didChange newState: RTCIceGatheringState) {}
+    func peerConnection(_ pc: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
+    func peerConnection(_ pc: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {}
 }

@@ -1,155 +1,228 @@
 import Foundation
 import Combine
+import WebRTC
 
-protocol SignalingServiceDelegate: AnyObject {
-    func didReceiveOffer(_ sdp: String)
-    func didReceiveAnswer(_ sdp: String)
-    func didReceiveIceCandidate(_ candidate: [String: Any])
+// MARK: - Signaling Events
+enum SignalingEvent {
+    case connected(userId: String)
+    case incomingCall(from: String)
+    case callAccepted(from: String)
+    case offerReceived(sdp: String, from: String)
+    case answerReceived(sdp: String)
+    case iceReceived(candidate: RTCIceCandidate)
+    case callEnded
 }
 
-final class SignalingService: NSObject, ObservableObject {
 
-    // MARK: - Properties
-    private var webSocketTask: URLSessionWebSocketTask?
-    weak var delegate: SignalingServiceDelegate?
+final class SignalingClient: NSObject, ObservableObject {
 
-    @Published private(set) var isConnected: Bool = false
+    // MARK: - CONFIG (YAHI NGROK URL)
+    private let signalingURL = URL(
+        string: "wss://maneuverable-cognatic-jaydon.ngrok-free.dev"
+    )!
+
+    // MARK: - Published
+    @Published var isConnected = false
+    @Published var myUserId: String?
+
+    // MARK: - Callback
+    var onEvent: ((SignalingEvent) -> Void)?
+
+    // MARK: - Internal
+    private var socket: URLSessionWebSocketTask?
+    private var session: URLSession?
 
     // MARK: - Connect
     func connect() {
-
-        guard !isConnected else {
-            print("⚠️ [Signaling] Already connected, skipping connect()")
+        guard socket == nil else {
+            print("⚠️ [Signaling] Already connected")
             return
         }
 
-        print("🔌 [Signaling] Connecting WebSocket")
+        print("🔌 [Signaling] Connecting → \(signalingURL)")
 
-        let session = URLSession(
+        session = URLSession(
             configuration: .default,
             delegate: self,
             delegateQueue: .main
         )
 
-        webSocketTask = session.webSocketTask(
-            with: AppConfig.signalingURL
-        )
-
-        webSocketTask?.resume()
-        receive()
+        socket = session?.webSocketTask(with: signalingURL)
+        socket?.resume()
+        receiveLoop()
     }
 
-    // MARK: - Receive loop
-    private func receive() {
-
-        guard isConnected || webSocketTask != nil else {
-            print("⚠️ [Signaling] Receive stopped (socket not active)")
-            return
-        }
-
-        webSocketTask?.receive { [weak self] result in
+    // MARK: - Receive Loop
+    private func receiveLoop() {
+        socket?.receive { [weak self] result in
             guard let self else { return }
 
             switch result {
-
             case .failure(let error):
                 print("❌ [Signaling] Receive error:", error)
-                self.cleanup()
 
             case .success(let message):
                 if case .string(let text) = message {
-                    print("📩 [Signaling] Received:", text)
                     self.handleMessage(text)
-                    self.receive() // 🔁 continue loop
                 }
             }
+
+            // keep listening
+            self.receiveLoop()
         }
     }
 
-    // MARK: - Handle incoming signal
+    // MARK: - Handle Message
     private func handleMessage(_ text: String) {
+        print("📩 [Signaling] Received:", text)
 
         guard
             let data = text.data(using: .utf8),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let type = json["type"] as? String
         else {
-            print("⚠️ [Signaling] Invalid JSON message")
+            print("⚠️ Invalid signaling message")
             return
         }
-
-        print("🔎 [Signaling] Type:", type)
 
         switch type {
 
+        case "registered":
+            let id = json["userId"] as! String
+            myUserId = id
+            isConnected = true
+            onEvent?(.connected(userId: id))
+            print("✅ Registered as:", id)
+
+        case "incoming-call":
+            let from = json["from"] as! String
+            onEvent?(.incomingCall(from: from))
+
+        case "call-accepted":
+            let from = json["from"] as! String
+            onEvent?(.callAccepted(from: from))
+
         case "offer":
-            if let sdp = json["sdp"] as? String {
-                delegate?.didReceiveOffer(sdp)
-            }
+            onEvent?(
+                .offerReceived(
+                    sdp: json["sdp"] as! String,
+                    from: json["from"] as! String
+                )
+            )
 
         case "answer":
-            if let sdp = json["sdp"] as? String {
-                delegate?.didReceiveAnswer(sdp)
-            }
+            onEvent?(.answerReceived(sdp: json["sdp"] as! String))
 
         case "ice-candidate":
-            if let candidate = json["candidate"] as? [String: Any] {
-                delegate?.didReceiveIceCandidate(candidate)
-            }
+            let c = json["candidate"] as! [String: Any]
+            let ice = RTCIceCandidate(
+                sdp: c["candidate"] as! String,
+                sdpMLineIndex: c["sdpMLineIndex"] as! Int32,
+                sdpMid: c["sdpMid"] as? String
+            )
+            onEvent?(.iceReceived(candidate: ice))
 
-        case "busy":
-            print("⛔ [Signaling] Server busy – another peer already connected")
-
-        case "peer-left":
-            print("👋 [Signaling] Peer left the call")
+        case "end-call":
+            onEvent?(.callEnded)
 
         default:
-            print("⚠️ [Signaling] Unknown type:", type)
+            print("⚠️ Unknown signaling type:", type)
         }
     }
 
-    // MARK: - Send
-    func send(_ dict: [String: Any]) {
+    // MARK: - Send Helpers
 
-        guard isConnected else {
-            print("❌ [Signaling] Send failed – socket not connected")
+    func sendRegister() {
+        send(["type": "register"])
+    }
+
+    func startCall(to userId: String) {
+        send([
+            "type": "start-call",
+            "to": userId
+        ])
+    }
+
+    func acceptCall(from userId: String) {
+        send([
+            "type": "call-accepted",
+            "to": userId
+        ])
+    }
+
+    func sendOffer(to userId: String, sdp: String) {
+        send([
+            "type": "offer",
+            "to": userId,
+            "sdp": sdp
+        ])
+    }
+
+    func sendAnswer(to userId: String, sdp: String) {
+        send([
+            "type": "answer",
+            "to": userId,
+            "sdp": sdp
+        ])
+    }
+
+    func sendICE(to userId: String, candidate: RTCIceCandidate) {
+        send([
+            "type": "ice-candidate",
+            "to": userId,
+            "candidate": [
+                "sdpMid": candidate.sdpMid ?? "",
+                "sdpMLineIndex": candidate.sdpMLineIndex,
+                "candidate": candidate.sdp
+            ]
+        ])
+    }
+
+    func endCall(to userId: String) {
+        send([
+            "type": "end-call",
+            "to": userId
+        ])
+    }
+
+    // MARK: - Raw Send
+    private func send(_ payload: [String: Any]) {
+        guard let socket else {
+            print("❌ [Signaling] Socket not connected")
             return
         }
 
-        guard let data = try? JSONSerialization.data(withJSONObject: dict),
-              let text = String(data: data, encoding: .utf8)
-        else {
-            print("❌ [Signaling] Failed to encode message")
-            return
-        }
+        let data = try! JSONSerialization.data(withJSONObject: payload)
+        let text = String(data: data, encoding: .utf8)!
 
         print("📤 [Signaling] Sending:", text)
 
-        webSocketTask?.send(.string(text)) { error in
+        socket.send(.string(text)) { error in
             if let error {
                 print("❌ [Signaling] Send error:", error)
             }
         }
     }
 
-    // MARK: - Cleanup
-    private func cleanup() {
-        print("🧹 [Signaling] Cleaning up socket")
-        webSocketTask = nil
+    // MARK: - Disconnect
+    func disconnect() {
+        socket?.cancel(with: .goingAway, reason: nil)
+        socket = nil
         isConnected = false
+        print("🔌 [Signaling] Disconnected")
     }
 }
 
-// MARK: - URLSessionWebSocketDelegate
-extension SignalingService: URLSessionWebSocketDelegate {
+// MARK: - WebSocket Delegate
+extension SignalingClient: URLSessionWebSocketDelegate {
 
     func urlSession(
         _ session: URLSession,
         webSocketTask: URLSessionWebSocketTask,
         didOpenWithProtocol protocol: String?
     ) {
-        print("✅ [Signaling] WebSocket OPEN")
-        isConnected = true
+        print("🌐 [Signaling] WebSocket OPEN")
+        sendRegister()
     }
 
     func urlSession(
@@ -159,6 +232,6 @@ extension SignalingService: URLSessionWebSocketDelegate {
         reason: Data?
     ) {
         print("🔌 [Signaling] WebSocket CLOSED")
-        cleanup()
+        isConnected = false
     }
 }
