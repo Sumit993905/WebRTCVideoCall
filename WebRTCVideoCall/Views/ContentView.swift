@@ -12,38 +12,29 @@ enum AppUIState {
 
 
 struct ContentView: View {
-
-    // MARK: - Core
     @StateObject private var signaling = SignalingClient()
     @StateObject private var rtc: WebRTCManager
-
-    // MARK: - UI State
+    
     @State private var uiState: AppUIState = .connecting
     @State private var targetUserId: String = ""
 
-    // MARK: - Init (SAME signaling instance)
     init() {
-        let signalingClient = SignalingClient()
-        _signaling = StateObject(wrappedValue: signalingClient)
-        _rtc = StateObject(wrappedValue: WebRTCManager(signaling: signalingClient))
+        let s = SignalingClient()
+        _signaling = StateObject(wrappedValue: s)
+        _rtc = StateObject(wrappedValue: WebRTCManager(signaling: s))
     }
 
     var body: some View {
         ZStack {
             switch uiState {
-
             case .connecting:
-                connectingView
-
+                VStack { ProgressView(); Text("Connecting...") }
             case .ready:
                 readyView
-
             case .outgoingCall(let to):
-                outgoingCallView(to: to)
-
+                VStack { Text("Calling \(to)..."); Button("Cancel") { endCall() } }
             case .incomingCall(let from):
                 incomingCallView(from: from)
-
             case .inCall:
                 videoCallView
             }
@@ -53,207 +44,63 @@ struct ContentView: View {
             signaling.connect()
         }
     }
-}
 
-private extension ContentView {
+    private var readyView: some View {
+        VStack(spacing: 20) {
+            Text("My ID: \(signaling.myUserId ?? "...")").bold()
+            TextField("Enter Target ID", text: $targetUserId).textFieldStyle(.roundedBorder)
+            Button("Start Call") {
+                rtc.startCallAsSender(to: targetUserId)
+                uiState = .outgoingCall(to: targetUserId)
+            }.buttonStyle(.borderedProminent)
+        }.padding()
+    }
 
-    var connectingView: some View {
-        VStack(spacing: 16) {
-            ProgressView()
-            Text("Connecting to server...")
-                .font(.headline)
+    private func incomingCallView(from: String) -> some View {
+        VStack {
+            Text("Incoming from \(from)")
+            HStack {
+                Button("Accept") { rtc.acceptIncomingCall() }.foregroundColor(.green)
+                Button("Reject") { endCall() }.foregroundColor(.red)
+            }
         }
     }
-}
 
+    private var videoCallView: some View {
+        ZStack {
+            VideoRendererView(videoTrack: rtc.remoteVideoTrack, isLocal: false)
+                .background(Color.black)
+            
+            VStack {
+                HStack {
+                    Spacer()
+                    VideoRendererView(videoTrack: rtc.localVideoTrack, isLocal: true)
+                        .frame(width: 120, height: 160).cornerRadius(12).padding()
+                }
+                Spacer()
+                Button("End Call") { endCall() }
+                    .padding().background(Color.red).foregroundColor(.white).clipShape(Capsule())
+            }
+        }
+    }
 
-private extension ContentView {
-
-    func bindSignaling() {
+    private func bindSignaling() {
         signaling.onEvent = { event in
             DispatchQueue.main.async {
                 switch event {
-
-                case .connected:
-                    uiState = .ready
-
-                case .incomingCall(let from):
-                    uiState = .incomingCall(from: from)
-
-                case .callAccepted:
-                    uiState = .inCall
-
-                case .offerReceived:
-                    uiState = .inCall
-
-                case .answerReceived:
-                    uiState = .inCall
-
-                case .callEnded:
-                    endCall()
-
-                default:
-                    break
+                case .connected: uiState = .ready
+                case .incomingCall(let from): uiState = .incomingCall(from: from)
+                case .callAccepted, .offerReceived, .answerReceived:
+                    uiState = .inCall // Kisi bhi state mein stream start ho sakti hai
+                case .callEnded: endCall()
+                default: break
                 }
             }
         }
     }
 
-    func endCall() {
+    private func endCall() {
         rtc.endCall()
         uiState = .ready
     }
 }
-private extension ContentView {
-
-    var readyView: some View {
-        VStack(spacing: 24) {
-
-            Text("📞 WebRTC Video Call")
-                .font(.largeTitle)
-                .bold()
-
-            VStack(spacing: 6) {
-                Text("Your User ID")
-                    .font(.caption)
-                    .foregroundColor(.gray)
-
-                Text(signaling.myUserId ?? "--")
-                    .font(.title3)
-                    .bold()
-            }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 12) {
-
-                Text("Call another user")
-                    .font(.headline)
-
-                TextField("Enter User ID", text: $targetUserId)
-                    .textFieldStyle(.roundedBorder)
-
-                Button {
-                    rtc.startCallAsSender(to: targetUserId)
-                    uiState = .outgoingCall(to: targetUserId)
-                } label: {
-                    Text("Start Video Call")
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(Color.blue)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                }
-                .disabled(targetUserId.isEmpty)
-            }
-        }
-        .padding()
-    }
-}
-private extension ContentView {
-
-    func outgoingCallView(to userId: String) -> some View {
-        VStack(spacing: 20) {
-            ProgressView()
-            Text("Calling \(userId)...")
-                .font(.headline)
-
-            Button("Cancel Call") {
-                endCall()
-            }
-            .foregroundColor(.red)
-        }
-    }
-}
-private extension ContentView {
-
-    func incomingCallView(from userId: String) -> some View {
-        VStack(spacing: 24) {
-
-            Text("📲 Incoming Call")
-                .font(.largeTitle)
-                .bold()
-
-            Text("From")
-                .foregroundColor(.gray)
-
-            Text(userId)
-                .font(.title2)
-                .bold()
-
-            HStack(spacing: 20) {
-
-                Button {
-                    rtc.acceptIncomingCall()
-                    uiState = .inCall
-                } label: {
-                    Text("Accept")
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(Color.green)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                }
-
-                Button {
-                    endCall()
-                } label: {
-                    Text("Reject")
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(Color.red)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                }
-            }
-        }
-        .padding()
-    }
-}
-private extension ContentView {
-
-    var videoCallView: some View {
-        ZStack {
-
-            // REMOTE (FULL SCREEN)
-            VideoRendererView(
-                videoTrack: rtc.remoteVideoTrack,
-                isLocal: false
-            )
-            .ignoresSafeArea()
-
-            // LOCAL (SMALL FLOATING)
-            VStack {
-                HStack {
-                    Spacer()
-                    VideoRendererView(
-                        videoTrack: rtc.localVideoTrack,
-                        isLocal: true
-                    )
-                    .frame(width: 120, height: 160)
-                    .cornerRadius(12)
-                    .padding()
-                }
-                Spacer()
-            }
-
-            // END CALL BUTTON
-            VStack {
-                Spacer()
-                Button {
-                    endCall()
-                } label: {
-                    Text("End Call")
-                        .padding()
-                        .frame(width: 160)
-                        .background(Color.red)
-                        .foregroundColor(.white)
-                        .cornerRadius(30)
-                }
-                .padding(.bottom, 40)
-            }
-        }
-    }
-
-}
-
