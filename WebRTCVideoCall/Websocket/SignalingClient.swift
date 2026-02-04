@@ -16,7 +16,6 @@ enum SignalingEvent {
 final class SignalingClient: NSObject, ObservableObject {
 
     // MARK: - CONFIG
-    // Note: Har restart par Ngrok URL change hoti hai, usey update karte rahein.
     private let signalingURL = URL(string: "wss://maneuverable-cognatic-jaydon.ngrok-free.dev")!
 
     // MARK: - Published
